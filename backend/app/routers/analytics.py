@@ -113,4 +113,4 @@ async def get_group_performance(lab: str, session: AsyncSession = Depends(get_se
     )
     
     result = await session.execute(stmt)
-    return result.mappings().all()
+    return result.mappings().all()# empty comment for pr
