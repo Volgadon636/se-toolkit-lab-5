@@ -9,6 +9,7 @@ Both require HTTP Basic Auth (email + password from settings).
 
 from datetime import datetime
 
+import httpx
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.settings import settings
@@ -31,7 +32,15 @@ async def fetch_items() -> list[dict]:
     - Return the parsed list of dicts
     - Raise an exception if the response status is not 200
     """
-    raise NotImplementedError
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            f"{settings.autochecker_api_url}/api/items",
+            auth=httpx.BasicAuth(
+                settings.autochecker_email, settings.autochecker_password
+            ),
+        )
+        response.raise_for_status()
+        return response.json()
 
 
 async def fetch_logs(since: datetime | None = None) -> list[dict]:
@@ -50,7 +59,35 @@ async def fetch_logs(since: datetime | None = None) -> list[dict]:
       - Use the submitted_at of the last log as the new "since" value
     - Return the combined list of all log dicts from all pages
     """
-    raise NotImplementedError
+    all_logs: list[dict] = []
+    current_since = since
+
+    async with httpx.AsyncClient() as client:
+        while True:
+            params: dict[str, str | int] = {"limit": 500}
+            if current_since is not None:
+                params["since"] = current_since.isoformat()
+
+            response = await client.get(
+                f"{settings.autochecker_api_url}/api/logs",
+                auth=httpx.BasicAuth(
+                    settings.autochecker_email, settings.autochecker_password
+                ),
+                params=params,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            logs = data["logs"]
+            all_logs.extend(logs)
+
+            if not data.get("has_more", False):
+                break
+
+            # Use the submitted_at of the last log as the new "since"
+            current_since = datetime.fromisoformat(logs[-1]["submitted_at"])
+
+    return all_logs
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +116,65 @@ async def load_items(items: list[dict], session: AsyncSession) -> int:
     - Commit after all inserts
     - Return the number of newly created items
     """
-    raise NotImplementedError
+    from sqlmodel import select
+
+    from app.models.item import ItemRecord
+
+    new_count = 0
+    lab_lookup: dict[str, ItemRecord] = {}
+
+    # Process labs first (type="lab")
+    for item in items:
+        if item.get("type") != "lab":
+            continue
+
+        title = item["title"]
+        # Check if lab already exists
+        existing = await session.exec(
+            select(ItemRecord).where(
+                ItemRecord.type == "lab", ItemRecord.title == title
+            )
+        )
+        lab_item = existing.first()
+
+        if lab_item is None:
+            lab_item = ItemRecord(type="lab", title=title)
+            session.add(lab_item)
+            new_count += 1
+
+        # Map short lab ID (e.g., "lab-01") to the database record
+        lab_lookup[item["lab"]] = lab_item
+
+    # Process tasks (type="task")
+    for item in items:
+        if item.get("type") != "task":
+            continue
+
+        title = item["title"]
+        lab_short_id = item["lab"]
+        parent_lab = lab_lookup.get(lab_short_id)
+
+        if parent_lab is None:
+            # Parent lab not found, skip this task
+            continue
+
+        # Check if task already exists with this title and parent_id
+        existing = await session.exec(
+            select(ItemRecord).where(
+                ItemRecord.type == "task",
+                ItemRecord.title == title,
+                ItemRecord.parent_id == parent_lab.id,
+            )
+        )
+        task_item = existing.first()
+
+        if task_item is None:
+            task_item = ItemRecord(type="task", title=title, parent_id=parent_lab.id)
+            session.add(task_item)
+            new_count += 1
+
+    await session.commit()
+    return new_count
 
 
 async def load_logs(
@@ -121,7 +216,84 @@ async def load_logs(
     - Commit after all inserts
     - Return the number of newly created interactions
     """
-    raise NotImplementedError
+    from datetime import datetime
+
+    from sqlmodel import select
+
+    from app.models.interaction import InteractionLog
+    from app.models.item import ItemRecord
+    from app.models.learner import Learner
+
+    # Build lookup: (lab_short_id, task_short_id_or_none) -> item title
+    item_title_lookup: dict[tuple[str, str | None], str] = {}
+    for item in items_catalog:
+        lab_id = item["lab"]
+        task_id = item.get("task")  # None for labs
+        title = item["title"]
+        item_title_lookup[(lab_id, task_id)] = title
+
+    new_count = 0
+
+    for log in logs:
+        # 1. Find or create learner
+        student_id = str(log["student_id"])
+        learner = await session.exec(
+            select(Learner).where(Learner.external_id == student_id)
+        )
+        learner_item = learner.first()
+
+        if learner_item is None:
+            learner_item = Learner(
+                external_id=student_id,
+                student_group=log.get("group", ""),
+            )
+            session.add(learner_item)
+            await session.flush()  # Get the ID
+
+        # 2. Find matching item
+        lab_id = log["lab"]
+        task_id = log.get("task")  # Can be None
+        item_title = item_title_lookup.get((lab_id, task_id))
+
+        if item_title is None:
+            # No matching item found, skip this log
+            continue
+
+        item_record = await session.exec(
+            select(ItemRecord).where(ItemRecord.title == item_title)
+        )
+        item_item = item_record.first()
+
+        if item_item is None:
+            # Item not in DB, skip this log
+            continue
+
+        # 3. Check if InteractionLog with this external_id already exists
+        log_external_id = log["id"]
+        existing_interaction = await session.exec(
+            select(InteractionLog).where(InteractionLog.external_id == log_external_id)
+        )
+        if existing_interaction.first() is not None:
+            # Already exists, skip
+            continue
+
+        # 4. Create InteractionLog
+        submitted_at = datetime.fromisoformat(log["submitted_at"])
+        interaction = InteractionLog(
+            external_id=log_external_id,
+            learner_id=learner_item.id,
+            item_id=item_item.id,
+            kind="attempt",
+            score=log.get("score"),
+            checks_passed=log.get("passed"),
+            checks_total=log.get("total"),
+            created_at=submitted_at,
+        )
+        session.add(interaction)
+        new_count += 1
+
+    await session.commit()
+    return new_count
 
 
 # ---------------------------------------------------------------------------
@@ -144,4 +316,27 @@ async def sync(session: AsyncSession) -> dict:
     - Return a dict: {"new_records": <number of new interactions>,
                       "total_records": <total interactions in DB>}
     """
-    raise NotImplementedError
+    from sqlmodel import select
+
+    from app.models.interaction import InteractionLog
+
+    # Step 1: Fetch and load items
+    raw_items = await fetch_items()
+    await load_items(raw_items, session)
+
+    # Step 2: Determine the last synced timestamp
+    last_interaction = await session.exec(
+        select(InteractionLog).order_by(InteractionLog.created_at.desc()).limit(1)
+    )
+    last_record = last_interaction.first()
+    since = last_record.created_at if last_record else None
+
+    # Step 3: Fetch and load logs
+    raw_logs = await fetch_logs(since=since)
+    new_records = await load_logs(raw_logs, raw_items, session)
+
+    # Count total records in DB
+    total_result = await session.exec(select(InteractionLog))
+    total_records = len(total_result.all())
+
+    return {"new_records": new_records, "total_records": total_records}
